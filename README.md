@@ -1,6 +1,6 @@
 # artcraft-common-actions
 
-<a href="https://sonarcloud.io/project/overview?id=storytold_craft-common-actions"><img alt="Scanned by SonarCloud" src="https://img.shields.io/badge/Scanned_by-SonarCloud-4b9fd5?style=flat-square&logo=sonarqubecloud&logoColor=white"></a>
+<a href="https://sonarcloud.io/project/overview?id=storytold_craft-common-actions"><img alt="Scanned by SonarCloud" src="https://img.shields.io/badge/Scanned_by-SonarCloud-4b9fd5?style=flat-square&logo=sonarqubecloud&logoColor=white"></a> <!-- rumdl-disable-line no-inline-html -->
 
 Reusable GitHub Actions workflows and composite actions for Storyteller / ArtCraft desktop and web applications.
 
@@ -9,18 +9,21 @@ This repository unifies and eliminates duplicate CI/CD and release workflow defi
 ## Workflows Included
 
 ### 1. `release.yml`
+
 Full multi-platform release pipeline for Craft apps:
+
 - **macOS universal** (x86_64 + aarch64 universal bundle, DMG, CLI, Developer ID codesign & notarization)
 - **Windows** (x64, x86, ARM64 MSI installer with WiX v5, CLI, Azure Trusted Signing)
 - **Linux** (x86_64, aarch64 AppImage, deb, rpm, tar.gz via nfpm)
 - **Flatpak** (x86_64, aarch64 bundle generation)
-- **FreeBSD** (FreeBSD 15.1-STABLE VM build & packaging for x86_64; aarch64 releases are paused, see #39)
+- **FreeBSD** (FreeBSD 15.1-STABLE VM build & packaging for x86_64; aarch64 is cross-compiled in the same x86_64 VM and opt-in through `freebsd-architectures`, see #39)
 - **Arch Linux** (x86_64, aarch64 `.pkg.tar.zst` built via `makepkg` from release tarball, named by bundle id; set `has-arch: false` to skip)
 - **WebAssembly** (wasm32-unknown-unknown with Trunk)
-- **Linux RISC-V 64** (cross-compilation for riscv64gc-unknown-linux-gnu, producing deb, rpm, and tar.gz via SHA256-verified nfpm)
+- **Linux RISC-V 64** (cross-compilation for riscv64gc-unknown-linux-gnu, producing deb, rpm, and tar.gz via SHA256-verified nfpm; built on Ubuntu 24.04, so it sets `GLIBC_FLOOR=2.39` for the app's `nfpm.yaml` to declare, see #44)
 - **Draft Release** (computes `SHA256SUMS.txt` and publishes/updates draft GitHub Release)
 
-#### Caller Example:
+#### Caller Example
+
 ```yaml
 name: Release
 
@@ -67,6 +70,32 @@ jobs:
 
 List every signing secret explicitly. The signing jobs run in the caller repo's `release` environment and read the values from there, but only for the names listed here: an unlisted name is empty. On the `release` branch the macOS and Windows jobs fail when their signing secrets are empty, rather than shipping unsigned builds.
 
+macOS and Windows packages are signed by the app's own packaging scripts. `release.yml` does not request `id-token` or `attestations`, so existing callers keep building as they do now.
+
+Build provenance, a CycloneDX SBOM, and a Sigstore signature of the published files are a second job. Add it only in an app that is ready to grant those permissions. `release.yml` does not call `supply-chain.yml`.
+
+```yaml
+  supply-chain:
+    needs: release
+    if: github.ref == 'refs/heads/release'
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    uses: storytold/craft-common-actions/.github/workflows/supply-chain.yml@main
+    with:
+      version: ${{ needs.release.outputs.version }}
+```
+
+After a release that ran the extra job:
+
+```sh
+gh attestation verify PhotoCraft-1.2.3-macos-universal.zip --owner storytold
+```
+
+The command checks the signature and prints the repository and commit that built the file. The SBOM is attached to the draft release as `sbom.cyclonedx.json`.
+
 `craft-fonts-ref` feeds the desktop builds. It defaults to the suite's craft-fonts pin, so one bump
 here reaches every app's next release; set it only when an app needs another commit. Every desktop
 build runs with `CRAFT_FONTS_DIR` and `CRAFT_FONTS_REQUIRED=1`: an app whose `build.rs` reads
@@ -74,8 +103,17 @@ craft-fonts fails the build instead of shipping without its fonts. The web build
 too only with `web-craft-fonts: true`: each app's `build.rs` decides which fonts its web build
 embeds (craft-fonts `docs/integration.md`), so opt in once that list fits the app's web size budget.
 
+An app pins its craft-i18n commit in `craft-i18n.rev` at its root, one SHA (keep it LF with
+`craft-i18n.rev text eol=lf` in `.gitattributes`). Its presence switches craft-i18n on: every
+build job, here and in `freebsd.yml` and `windows-arm64.yml`, checks out craft-i18n at that SHA
+and builds with `CRAFT_I18N_DIR` and `CRAFT_I18N_REQUIRED=1`. Packaging `needs:` the
+[i18n gate](#6-i18n-gateyml). A manual run can pass `skip-i18n-gate: true`; other events ignore it.
+An app without `craft-i18n.rev` builds as before.
+
 ### 2. `packaging-lint.yml`
+
 Lints all packaging configurations and metadata:
+
 - `actionlint` for workflow syntax
 - `shellcheck` for shell scripts and AppRun
 - PowerShell parser validation for WiX helper scripts
@@ -85,7 +123,8 @@ Lints all packaging configurations and metadata:
 - Flatpak manifest consistency checks
 - FreeBSD dry run & embedded icons verification
 
-#### Caller Example:
+#### Caller Example
+
 ```yaml
 name: Packaging lint
 
@@ -110,9 +149,11 @@ jobs:
 ```
 
 ### 3. `windows-arm64.yml`
+
 Cross-compiles ARM64 MSI on x64 Windows runner, then installs, verifies native ARM64 architecture (`0xAA64`), smoke tests the CLI, and uninstalls on a Windows 11 ARM64 runner.
 
-#### Caller Example:
+#### Caller Example
+
 ```yaml
 name: Windows ARM64
 
@@ -147,11 +188,22 @@ jobs:
 ```
 
 ### 4. `freebsd.yml`
+
 Builds and runs workspace tests inside a FreeBSD 15 VM on a Linux runner.
 Pull requests default to `x86_64`; pushes, schedules and manual runs retain both
-`x86_64` and `aarch64`. ARM64 is software-emulated on the x86 Linux runner and can
-take several hours. The release workflow continues to build **both** FreeBSD
-architectures, including their release artifacts.
+`x86_64` and `aarch64`. Both boot a KVM-accelerated x86_64 VM; `aarch64` is
+cross-compiled in it with stable Rust (the standard library comes from FreeBSD's
+aarch64 `lang/rust` package, against an arm64 sysroot built from `base.txz`). Its
+tests are built but not run, and its package check is skipped.
+
+The release workflow builds FreeBSD aarch64 the same way, but only when the caller
+sets `freebsd-architectures: '["x86_64","aarch64"]'` (the default is `'["x86_64"]'`).
+Opt in only once the app's `packaging/freebsd/package.sh` builds with
+`CARGO_BUILD_TARGET`, reads binaries from
+`$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release` and names its archive
+`*-freebsd-aarch64.tar.gz`: the guest's `uname -m` is always `amd64`. The release
+job fails if an archive does not match its matrix architecture. Apps without a
+`package.sh` use the built-in packager, which already handles the cross target.
 
 The optional `architectures` input overrides the check matrix with a JSON array,
 for example `'["aarch64"]'` for a dedicated ARM check or
@@ -167,12 +219,16 @@ data and compiled targets through `actions/freebsd-cargo-cache`. The VM starts
 first; the action fingerprints its actual Rust compiler, FreeBSD kernel/userland,
 architecture and installed package versions. Inputs (including font refs and
 feature/test options), manifests, lockfiles, build scripts, Cargo configuration,
-toolchain files and packaging scripts also partition the cache. New commits may
-restore a compatible earlier commit; toolchain/configuration/lockfile changes
-start a new cache. Build metadata changes still go through Cargo's normal
-invalidation. The test and release workflows use separate profile namespaces. The workflow-file
-pattern fingerprints the caller's configuration; changes to the shared workflow
-that need a new namespace must bump the cache action's version prefix.
+toolchain files and packaging scripts decide which cache is an exact match. When
+there is no exact match, the action falls back to the most recent cache with the
+same toolchain, configuration and profile, so a release that only bumps a version,
+or a PR that touches a manifest, still restores compiled dependencies instead of
+rebuilding them cold; Cargo's own fingerprints decide which of those artifacts
+are still valid. Toolchain, configuration and profile changes start a new cache
+without a fallback. The test and release workflows use separate profile
+namespaces. The workflow-file pattern fingerprints the caller's configuration;
+changes to the shared workflow that need a new namespace must bump the cache
+action's version prefix.
 
 Cache data is restored on the host and explicitly transferred to the guest's
 `/var/tmp/craft-cargo` and `/var/tmp/craft-target`. Only registry/git data and
@@ -202,6 +258,15 @@ available to builds, default tests and custom tests through `CRAFT_FONTS_DIR`. S
 the checkout is missing.
 The application's build script validates its required font faces.
 
+Tests (default and custom) run as an ordinary user, `craft-test`, not root: root is never
+refused a file, so a test that expects "permission denied" would fail. The build and packaging
+stay root.
+
+`cargo-build-extra-args` and `cargo-test-extra-args` accept whitespace-separated
+arguments with shell-style quotes and escapes for values containing spaces.
+Arguments are passed literally: shell commands, variable expansion and globbing
+are not evaluated. Malformed quoting fails the invoked build or test step.
+
 Use a multiline `custom-test-command` for separate test groups. It runs in a
 separate `sh -eu` process whose failure stops the VM script before packaging.
 Do not rely on `errexit` to catch nonfinal commands of an `&&` list followed by
@@ -212,7 +277,8 @@ succeed, then requires at least one readable `*-freebsd-<arch>.tar.gz` in
 `dist/release` for each matrix architecture. Each archive is checked separately. The app's package script
 retains responsibility for its required binaries, metadata and licence files.
 
-#### Caller Example:
+#### Caller Example
+
 ```yaml
 name: FreeBSD
 
@@ -245,7 +311,12 @@ jobs:
 
 Evaluates the repository's Nix flake across supported systems without building, validating flake evaluation and `Cargo.lock` synchronization.
 
-#### Caller Example:
+`extra-args` defaults to `--no-build --all-systems`. It accepts whitespace-separated
+arguments with shell-style quotes and escapes for values containing spaces.
+Arguments are passed literally: shell commands, variable expansion and globbing
+are not evaluated. Malformed quoting fails the check.
+
+#### Caller Example
 
 ```yaml
 name: Nix
@@ -270,11 +341,31 @@ jobs:
     uses: storytold/craft-common-actions/.github/workflows/nix.yml@main
 ```
 
+### 6. `i18n-gate.yml`
+
+Runs the app's completeness tests, `cargo test --workspace i18n_gate` with `CRAFT_I18N_GATE=1`,
+against the craft-i18n commit in `craft-i18n.rev`. It fails if no test ran, since a filter that
+matches nothing passes: a pinned app needs at least one `i18n_gate_*` test. Without
+`craft-i18n.rev` it succeeds doing nothing, so jobs that `needs:` it still run.
+
+`release.yml` runs it before packaging. `freebsd.yml` runs it with `pin-changes-only: true`: only
+on a pull request whose diff touches `craft-i18n.rev`, whether or not `skip-tests` is set. An app
+with its own CI workflow calls it the same way:
+
+```yaml
+jobs:
+  i18n-gate:
+    uses: storytold/craft-common-actions/.github/workflows/i18n-gate.yml@main
+    with:
+      pin-changes-only: true
+```
+
 ## Composite Actions
 
 Individual actions are also available for composing custom pipelines:
 
 - `actions/checkout-craft-fonts`: Checks out `storytold/craft-fonts` at a designated ref.
+- `actions/checkout-craft-i18n`: Checks out `storytold/craft-i18n` at the caller's `craft-i18n.rev`, if any, and sets `CRAFT_I18N_DIR` and `CRAFT_I18N_REQUIRED=1`.
 - `actions/resolve-version`: Slices version from `packaging/env.sh` and validates format.
 - `actions/install-wix`: Installs WiX toolset and UI/Util extensions.
 - `actions/install-nfpm`: Installs `nfpm` with strict SHA256 checksum verification.
